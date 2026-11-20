@@ -365,3 +365,12 @@ func TestIdentifyInAPlaytestSendsNothing(t *testing.T) {
 		t.Fatal("a playtest run sent identify")
 	}
 }
+
+func TestAResetOpensASessionForAStoredIdentity(t *testing.T) {
+	api := newFakeAPI(t)
+	c, _ := newTestClient(t, api, testOpts{cfg: func(cfg *Config) { cfg.NoLifecycleEvents = true }})
+	c.Identify("acct-1")
+	waitFor(t, "identify", func() bool { return api.count("POST /identify") == 1 })
+	c.ResetDeviceID()
+	waitFor(t, "identify after the reset, with no event queued", func() bool { return api.count("POST /identify") == 2 })
+}

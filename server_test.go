@@ -327,3 +327,40 @@ func TestServerSendRespectsItsContext(t *testing.T) {
 		t.Fatal("Send outlived its context")
 	}
 }
+
+func TestServerFlushNeverCutsARetryAfterAndCopiesProperties(t *testing.T) {
+	api := newFakeAPI(t)
+	api.on("POST /site/server-events", func(w http.ResponseWriter, r recorded, n int) {
+		if n == 1 {
+			w.Header().Set("Retry-After", "30")
+			writeJSON(w, 429, `{"error":"rate_limited"}`)
+			return
+		}
+		serverAnswer(w, r)
+	})
+	s, _ := newTestServer(t, api, nil)
+	props := map[string]any{"mode": "ranked"}
+	if err := s.Track(ServerEvent{Name: "x", Properties: props}); err != nil {
+		t.Fatal(err)
+	}
+	props["mode"] = "casual" // the caller reuses its map
+	props["extra"] = 1
+	_ = s.Flush(context.Background())
+	_ = s.Flush(context.Background())
+	if n := api.count("POST /site/server-events"); n != 1 {
+		t.Fatalf("flush cut a Retry-After: %d requests", n)
+	}
+	s.mu.Lock()
+	s.retryUntil = time.Time{}
+	s.mu.Unlock()
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reqs := api.only("POST /site/server-events")
+	for _, r := range reqs {
+		p := serverEvents(t, r)[0]["properties"].(map[string]any)
+		if p["mode"] != "ranked" || p["extra"] != nil {
+			t.Fatalf("sent %v: the caller's later change leaked in", p)
+		}
+	}
+}

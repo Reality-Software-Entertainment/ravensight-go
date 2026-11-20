@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -151,7 +152,8 @@ type Server struct {
 	queue       []ServerEvent
 	stopped     string
 	backoff     time.Duration
-	nextAttempt time.Time
+	nextAttempt time.Time // the backoff: a flush or a close cuts it short
+	retryUntil  time.Time // the server's Retry-After or a fixed pause: never cut
 	batchDue    time.Time
 	batchLimit  int
 	stats       ServerStats
@@ -244,6 +246,9 @@ func (s *Server) prepareEvent(ev *ServerEvent, index int, now time.Time) error {
 	if err := validProperties(ev.Properties); err != "" {
 		return fail("Properties", err)
 	}
+	// A copy: the caller may reuse its map, and a resend must carry exactly
+	// the content its id was first sent with. The values are scalars.
+	ev.Properties = maps.Clone(ev.Properties)
 	return nil
 }
 
@@ -646,6 +651,9 @@ func (s *Server) nextWakeLocked() time.Time {
 	if !at.IsZero() && s.nextAttempt.After(at) {
 		at = s.nextAttempt
 	}
+	if !at.IsZero() && s.retryUntil.After(at) {
+		at = s.retryUntil
+	}
 	return at
 }
 
@@ -657,7 +665,7 @@ func (s *Server) drain(urgent bool) {
 		now := s.now()
 		due := len(s.queue) > 0 && s.stopped == "" &&
 			(urgent || s.closing || len(s.queue) >= maxBatch || (s.flushEvery > 0 && !now.Before(s.batchDue))) &&
-			(urgent || !now.Before(s.nextAttempt))
+			(urgent || !now.Before(s.nextAttempt)) && !now.Before(s.retryUntil)
 		if !due {
 			s.mu.Unlock()
 			return
@@ -717,7 +725,7 @@ func (s *Server) drain(urgent bool) {
 			// stop() already cleared the queue.
 		case outcomeRetry:
 			if out.exact {
-				s.nextAttempt = s.now().Add(out.wait)
+				s.retryUntil = s.now().Add(out.wait)
 			} else {
 				s.backoff = nextBackoff(s.backoff)
 				s.nextAttempt = s.now().Add(jitter(s.backoff, s.random))
@@ -789,8 +797,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		<-s.done
-		return nil
+		select {
+		case <-s.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.closing = true
 	s.mu.Unlock()

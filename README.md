@@ -270,17 +270,22 @@ the device by the caps below.
 
 | What | How it starts | What is sent |
 | --- | --- | --- |
-| A panic | `defer client.Recover()` at the top of `main` and of each goroutine you start. | On the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, the panic's type, its message and the stack. |
+| A panic | `defer client.Recover()` at the top of `main` and of each goroutine you start. | On the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, the panic's type, its message and the stack. A panic the program survived is sent at once as `uncaught`. |
 | Your game's log | `slog.New(client.LogHandler(yourHandler))`, or `client.Log(level, msg)` from your own logger. | A record at `slog.LevelError` or above: `rs_source: "log"`, `rs_severity: "warning"`. Every record feeds the trail. |
 | Your game's HTTP requests | `&http.Client{Transport: client.WrapTransport(http.DefaultTransport)}` | A network failure or `5xx` as `error`, a `4xx` as `warning`, `rs_source: "request"`, message `<METHOD> <host><path> <status>`. |
 | `client.TrackError(...)` | Your call. | As you wrote it, never held back by the switches below. |
 
 **Recover.** It writes one small file synchronously (readable by the
 player's account only), then panics again with the same value, so the game
-ends exactly as it would have. The next launch sends it once. A record
-older than 30 days is deleted unsent; at most 5 are kept. Go cannot recover
-a fatal runtime error (a concurrent map write, running out of memory), and
-a panic in a goroutine without its own `defer client.Recover()` is not
+ends exactly as it would have. The next launch sends it, and deletes the
+file once the server has the event, so a failed send never loses it. If the
+program is still running two seconds after the panic, an outer `recover`
+caught it (`net/http` does this for its handlers), so it was not a crash:
+the file is deleted and the panic is sent at once as `rs_source:
+"uncaught"`, `rs_severity: "error"`. At most 5 records are written a run
+and 5 kept; one older than 30 days is deleted unsent. Go cannot recover a
+fatal runtime error (a concurrent map write, running out of memory), and a
+panic in a goroutine without its own `defer client.Recover()` is not
 recorded.
 
 **The gate.** Nothing is captured without a key, before consent, while the
@@ -300,6 +305,7 @@ become `[token]` (a run that is a file path is kept); IP addresses become
 `[ip]`; home folders (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`)
 become `~`; a URL loses its query, fragment and `user:password@`. The
 message is cut to 200 characters, the stack to 2,000 and the type to 100.
+Once the caps are spent, a log line costs the hooks two atomic reads.
 
 **The trail** is an in-memory ring of the last 20 lines (log records at any
 level, and the names of events you track), `+<ms since start> <level>

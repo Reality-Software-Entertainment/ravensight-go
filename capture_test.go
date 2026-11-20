@@ -477,3 +477,199 @@ func TestWrapTransportCapturesTheGamesFailedRequests(t *testing.T) {
 		}
 	}
 }
+
+type nilErr struct{ msg string }
+
+func (e *nilErr) Error() string { return e.msg } // panics on a nil receiver
+
+func TestTheHooksSurviveATypedNilErrorAndKeepThePanicValue(t *testing.T) {
+	api := newFakeAPI(t)
+	c, _ := newTestClient(t, api, testOpts{})
+	mustFlush(t, c)
+	logger := slog.New(c.LogHandler(slog.NewTextHandler(discardWriter{}, nil)))
+	logger.Error("save failed", "err", (*nilErr)(nil)) // must not panic
+	var typed *nilErr
+	got := panicWith(c, typed)
+	if e, ok := got.(*nilErr); !ok || e != nil {
+		t.Fatalf("the panic value changed to %T %v", got, got)
+	}
+	mustFlush(t, c)
+	if len(capturesOf(t, api)) != 1 {
+		t.Fatal("the log error was not captured")
+	}
+}
+
+func TestARecoveredPanicIsSentAsUncaughtNotACrash(t *testing.T) {
+	api := newFakeAPI(t)
+	dir := t.TempDir()
+	c, _ := newTestClient(t, api, testOpts{dir: dir})
+	c.crashGrace = 20 * time.Millisecond
+	mustFlush(t, c)
+	panicWith(c, "handler blew up") // an outer recover catches it: the program lives on
+	waitFor(t, "the record to turn into a live capture", func() bool { return len(crashes(dir)) == 0 })
+	mustFlush(t, c)
+	caps := capturesOf(t, api)
+	if len(caps) != 1 || caps[0]["rs_source"] != "uncaught" || caps[0]["rs_severity"] != "error" {
+		t.Fatalf("captures %v", caps)
+	}
+	closeNow(t, c)
+	c2, _ := newTestClient(t, api, testOpts{dir: dir})
+	mustFlush(t, c2)
+	if len(capturesOf(t, api)) != 1 {
+		t.Fatal("a recovered panic was also sent as a crash")
+	}
+}
+
+func TestHeldCapturesAreSentWithoutLifecycleEvents(t *testing.T) {
+	api := newFakeAPI(t)
+	c, _ := newTestClient(t, api, testOpts{cfg: func(cfg *Config) { cfg.NoLifecycleEvents = true }})
+	c.Log(slog.LevelError, "only an error")
+	mustFlush(t, c)
+	if api.count("GET /settings") != 1 || len(capturesOf(t, api)) != 1 {
+		t.Fatalf("settings %d captures %d", api.count("GET /settings"), len(capturesOf(t, api)))
+	}
+}
+
+func TestSpentCapsStopTheHotPath(t *testing.T) {
+	api := newFakeAPI(t)
+	api.setCapture(`{"enabled":true,"trail":true}`)
+	clock := newFakeClock()
+	c, _ := newTestClient(t, api, testOpts{clock: clock})
+	mustFlush(t, c)
+	for m := 0; m < 6; m++ {
+		for i := 0; i < 6; i++ {
+			c.Log(slog.LevelError, fmt.Sprintf("problem %c%c", 'a'+m, 'a'+i))
+		}
+		clock.advance(time.Minute)
+	}
+	if c.capLive.Load() || c.trailLive.Load() {
+		t.Fatal("the hooks still pay after the caps are spent")
+	}
+	if !c.IsErrorCaptureActive() {
+		t.Fatal("spent caps are not the gate")
+	}
+	allocs := testing.AllocsPerRun(100, func() { c.Log(slog.LevelError, "another one") })
+	if allocs > 1 {
+		t.Fatalf("%v allocations a line once spent", allocs)
+	}
+	// One error repeated past its key's cap skips the scrub.
+	api2 := newFakeAPI(t)
+	c2, _ := newTestClient(t, api2, testOpts{})
+	mustFlush(t, c2)
+	for i := 0; i < 4; i++ {
+		c2.Log(slog.LevelError, "same thing")
+	}
+	c2.mu.Lock()
+	spent := c2.cap.spent["|same thing"]
+	c2.mu.Unlock()
+	if !spent {
+		t.Fatal("a key past its cap is not remembered")
+	}
+}
+
+func TestTenTrailsARunAtMostAndNeverTheLiveRingOnACrash(t *testing.T) {
+	api := newFakeAPI(t)
+	api.setCapture(`{"enabled":true,"trail":true}`)
+	dir := t.TempDir()
+	// Six crash records from the last run, each with its own trail, and one without.
+	now := time.Now().UnixMilli()
+	for i := 0; i < 5; i++ {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s%d-%03d.json", crashPrefix, now-int64(i), i)),
+			[]byte(fmt.Sprintf(`{"timestamp":%d,"message":"crash %c","trail":"+1 info old run %d"}`, now-int64(i), 'a'+i, i)), 0o600)
+	}
+	clock := newFakeClock()
+	c, _ := newTestClient(t, api, testOpts{dir: dir, clock: clock})
+	mustFlush(t, c)
+	for m := 0; m < 4; m++ {
+		for i := 0; i < 6; i++ {
+			c.Log(slog.LevelInfo, "line")
+			c.Log(slog.LevelError, fmt.Sprintf("live %c%c", 'a'+m, 'a'+i))
+		}
+		clock.advance(time.Minute)
+	}
+	mustFlush(t, c)
+	trails := 0
+	for _, d := range capturesOf(t, api) {
+		trail, has := d["rs_trail"].(string)
+		if has {
+			trails++
+		}
+		if d["rs_source"] == "crash" && has && !strings.Contains(trail, "old run") {
+			t.Fatalf("a crash carried this run's trail: %q", trail)
+		}
+	}
+	if trails != 10 {
+		t.Fatalf("%d trails sent", trails)
+	}
+}
+
+func TestACrashRecordStaysUntilItsEventIsAcknowledged(t *testing.T) {
+	api := newFakeAPI(t)
+	dir := t.TempDir()
+	c, _ := newTestClient(t, api, testOpts{dir: dir, cfg: func(cfg *Config) { cfg.MemoryOnlyQueue = true }})
+	mustFlush(t, c)
+	panicWith(c, "real crash")
+	closeNow(t, c)
+	api.on("POST /track/batch", func(w http.ResponseWriter, r recorded, n int) { writeJSON(w, 503, `{}`) })
+	c2, _ := newTestClient(t, api, testOpts{dir: dir, cfg: func(cfg *Config) { cfg.MemoryOnlyQueue = true }})
+	_ = flush(t, c2)
+	closeNow(t, c2)
+	if len(crashes(dir)) != 1 {
+		t.Fatal("a failed send lost the crash record")
+	}
+	api.on("POST /track/batch", nil)
+	c3, _ := newTestClient(t, api, testOpts{dir: dir})
+	mustFlush(t, c3)
+	if len(crashes(dir)) != 0 {
+		t.Fatal("the record outlived its acknowledgement")
+	}
+	n := 0
+	for _, d := range capturesOf(t, api) {
+		if d["rs_source"] == "crash" {
+			n++
+		}
+	}
+	if n < 1 {
+		t.Fatal("the crash was never sent")
+	}
+	if c3.Stats().Queued != 0 {
+		t.Fatal("left queued")
+	}
+}
+
+func TestOldRecordsArePrunedWhateverTheGate(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-40 * 24 * time.Hour).UnixMilli()
+	os.WriteFile(filepath.Join(dir, fmt.Sprintf("%s%d-aaa.json", crashPrefix, old)), []byte(`{"message":"x","trail":"t"}`), 0o600)
+	newTestClient(t, newFakeAPI(t), testOpts{dir: dir, cfg: func(cfg *Config) { cfg.NoErrorCapture = true }})
+	if len(crashes(dir)) != 0 {
+		t.Fatal("an old record survived with capture off")
+	}
+}
+
+func TestWrappingTwiceDoesNotDoubleCaptures(t *testing.T) {
+	c, _ := newTestClient(t, newFakeAPI(t), testOpts{})
+	h := c.LogHandler(discardHandler{})
+	if c.LogHandler(h) != h {
+		t.Fatal("LogHandler wrapped its own handler again")
+	}
+	rt := c.WrapTransport(nil)
+	if c.WrapTransport(rt) != rt {
+		t.Fatal("WrapTransport wrapped its own transport again")
+	}
+}
+
+func TestScrubMatchesTheServerOnUnicodeSpacesAndCaseFolding(t *testing.T) {
+	for in, want := range map[string]string{
+		"auth: Bearer\u00a0sk9secret":       "auth: [token]",
+		"GET https://a.io/x?y=1\u00a0after": "GET https://a.io/x\u00a0after",
+		"\u017fhttps://a.io/p?q=1":          "\u017fhttps://a.io/p",
+		"C:\\USERS\\Jo\\x.cs":               "~\\x.cs",
+		"C:\\U\u017fERS\\Jo\\x.cs":          "C:\\U\u017fERS\\Jo\\x.cs",
+		"ip FE80::1 and \u212a::1":          "ip [ip] and \u212a[ip]", // what the server gives too
+	} {
+		if got := scrub(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

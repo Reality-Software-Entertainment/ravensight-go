@@ -134,9 +134,7 @@ func (c *Client) identifyCanStoreLocked() bool {
 
 func (c *Client) identifyStoreLocked(hash string) {
 	c.id.stored = savedIdentity{Salt: c.id.launchSalt, AccountHash: hash}
-	if err := c.st.saveIdentity(c.id.stored); err != nil {
-		c.warnOnceLocked("identity_write", "Ravensight: could not save the identity file.")
-	}
+	c.saveIdentityLater()
 }
 
 // identifyForgetLocked drops the stored identity and any held id, and
@@ -145,7 +143,7 @@ func (c *Client) identifyForgetLocked() bool {
 	had := c.id.stored.AccountHash != "" || c.id.held != ""
 	if c.id.stored.AccountHash != "" {
 		c.id.stored = savedIdentity{}
-		_ = c.st.saveIdentity(savedIdentity{})
+		c.saveIdentityLater()
 	}
 	c.id.held = ""
 	c.id.identifiedSession = ""
@@ -171,7 +169,7 @@ func (c *Client) identifySessionAnswerLocked(salt string) {
 	if c.id.stored.AccountHash != "" && c.id.stored.Salt != salt {
 		// Made under another game's salt: deleted, never sent.
 		c.id.stored = savedIdentity{}
-		_ = c.st.saveIdentity(savedIdentity{})
+		c.saveIdentityLater()
 	}
 	if c.id.held != "" && c.identifyCanStoreLocked() {
 		c.identifyStoreLocked(accountHash(c.id.held, salt))

@@ -289,6 +289,7 @@ func newTestClient(t *testing.T, api *fakeAPI, o testOpts) (*Client, *logSink) {
 		now = o.clock.now
 	}
 	c := newClient(cfg, o.args, now, func() float64 { return 0.5 })
+	c.crashGrace = time.Hour // a recorded panic counts as a crash unless a test says otherwise
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

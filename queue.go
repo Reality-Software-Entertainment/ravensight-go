@@ -18,6 +18,7 @@ type qevent struct {
 	origin    json.RawMessage // the origin of the session it was tracked under
 	session   string          // origin.session, "" when unknown
 	capture   bool            // an automatic error capture
+	crashFile string          // a crash record this event was made from; it is the event's storage
 	inFlight  bool
 }
 
@@ -50,6 +51,9 @@ type queueEntry struct {
 func encodeQueue(events []*qevent) []byte {
 	file := queueFile{Version: 2, Groups: []queueGroup{}}
 	for _, e := range events {
+		if e.crashFile != "" {
+			continue // its crash record keeps it until it is acknowledged
+		}
 		data := e.saved
 		if data == nil {
 			data = e.data

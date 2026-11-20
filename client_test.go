@@ -1062,3 +1062,62 @@ func TestTrackNeverWaitsOnTheNetworkAndIsSafeAcrossGoroutines(t *testing.T) {
 	close(hang)
 	mustFlush(t, c)
 }
+
+func TestAPersistent401StillBacksOffToItsCeiling(t *testing.T) {
+	api := newFakeAPI(t)
+	api.on("POST /track/batch", func(w http.ResponseWriter, r recorded, n int) {
+		writeJSON(w, 401, `{"error":"signature_invalid"}`)
+	})
+	c, _ := newTestClient(t, api, testOpts{})
+	c.Track("x", nil)
+	var got []time.Duration
+	for i := 0; i < 4; i++ {
+		_ = flush(t, c)
+		c.mu.Lock()
+		got = append(got, c.backoff)
+		c.mu.Unlock()
+	}
+	want := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff %v, want %v", got, want)
+		}
+	}
+}
+
+func TestAShortSessionIsNotReadAsExpired(t *testing.T) {
+	api := newFakeAPI(t)
+	api.on("POST /session", func(w http.ResponseWriter, r recorded, n int) {
+		writeJSON(w, 201, fmt.Sprintf(`{"token":"tok-%d","expiresIn":30}`, n))
+	})
+	c, _ := newTestClient(t, api, testOpts{})
+	c.Track("x", nil)
+	mustFlush(t, c)
+	if n := api.count("POST /session"); n != 1 {
+		t.Fatalf("%d sessions for one batch", n)
+	}
+}
+
+func TestASecondShutdownHonoursItsOwnContext(t *testing.T) {
+	api := newFakeAPI(t)
+	release := make(chan struct{})
+	api.on("POST /track/batch", func(w http.ResponseWriter, r recorded, n int) {
+		<-release
+		writeJSON(w, 202, `{}`)
+	})
+	defer close(release)
+	c, _ := newTestClient(t, api, testOpts{})
+	c.Track("x", nil)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		_ = c.Shutdown(ctx)
+	}()
+	waitFor(t, "the first shutdown", func() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.closing })
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := c.Shutdown(ctx); err == nil || time.Since(start) > time.Second {
+		t.Fatalf("second shutdown: %v after %v", err, time.Since(start))
+	}
+}

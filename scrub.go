@@ -11,17 +11,37 @@ import (
 // binding set of cases. Go's regexp has no lookbehind, so the two rules that
 // need one (a URL scheme and an email must start a run) capture the
 // character before the match instead and put it back.
+// jsSpace is JavaScript's \s, which the server's rules use. Go's \s is
+// ASCII only, and Go's (?i) folds the long s and the Kelvin sign into
+// ASCII letters where JavaScript does not, so the patterns below spell
+// both out to match the server exactly.
+const jsSpace = `\t\n\v\f\r \x{00a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}`
+
+// ci spells a word case-insensitively with ASCII letters only.
+func ci(word string) string {
+	var b strings.Builder
+	for _, r := range word {
+		lower, upper := strings.ToLower(string(r)), strings.ToUpper(string(r))
+		if lower != upper {
+			b.WriteString("[" + upper + lower + "]")
+		} else {
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	return b.String()
+}
+
 var (
-	scrubURL       = regexp.MustCompile(`(?i)(^|[^a-z0-9+.-])([a-z][a-z0-9+.-]*://)(?:[^\s/?#@'"<>]*@)?([^\s?#'"<>]*)(?:[?#][^\s'"<>]*)?`)
-	scrubBearer    = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*`)
+	scrubURL       = regexp.MustCompile(`(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://)(?:[^` + jsSpace + `/?#@'"<>]*@)?([^` + jsSpace + `?#'"<>]*)(?:[?#][^` + jsSpace + `'"<>]*)?`)
+	scrubBearer    = regexp.MustCompile(`\b` + ci("Bearer") + `[` + jsSpace + `]+[A-Za-z0-9\-._~+/]+=*`)
 	scrubJWT       = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*`)
 	scrubKey       = regexp.MustCompile(`\bgt_[A-Za-z0-9_]+`)
 	scrubEmail     = regexp.MustCompile(`(^|[^A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
 	scrubHomeUnix  = regexp.MustCompile(`/(?:Users|home)/[^/\\'"<>:\r\n]+`)
-	scrubHomeWin   = regexp.MustCompile(`(?i)\b[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^/\\'"<>:\r\n]+`)
+	scrubHomeWin   = regexp.MustCompile(`\b[A-Za-z]:[\\/](?:` + ci("Users") + `|` + ci("Documents and Settings") + `)[\\/][^/\\'"<>:\r\n]+`)
 	scrubIPv4      = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
-	scrubIPv6Full  = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b`)
-	scrubIPv6Short = regexp.MustCompile(`(?i)(?:\b[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6}\b)?`)
+	scrubIPv6Full  = regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b`)
+	scrubIPv6Short = regexp.MustCompile(`(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6}\b)?`)
 	scrubLongRun   = regexp.MustCompile(`[A-Za-z0-9+/=_-]{32,}`)
 	pathLower      = regexp.MustCompile(`^[a-z0-9]+$`)
 	pathCamel      = regexp.MustCompile(`^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$`)

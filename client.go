@@ -90,8 +90,10 @@ type Client struct {
 	playtest     Playtest
 	now          func() time.Time
 	random       func() float64
+	crashGrace   time.Duration // how long a recorded panic waits to count as recovered; tests shorten it
 
 	persistMu sync.Mutex // serializes queue file writes and deletes
+	ioMu      sync.Mutex // serializes the device id and identity file writes
 
 	mu    sync.Mutex
 	after []func() // log lines and callbacks, run after mu is released
@@ -252,6 +254,7 @@ func newClient(cfg Config, args []string, now func() time.Time, random func() fl
 		state := c.st.loadState()
 		c.optedOut, c.optedIn = state.OptedOut, state.OptedIn
 		c.id.stored = c.st.loadIdentity()
+		c.pruneCrashes() // records past 30 days or 5 go whatever the gate says
 	}
 	if cfg.CampaignLink != "" {
 		_ = c.SetCampaignLink(cfg.CampaignLink) // a bad one is refused with one warning
@@ -397,11 +400,8 @@ func (c *Client) loadOrMakeDeviceIDLocked() string {
 			return id
 		}
 	}
-	id := newDeviceID()
-	if err := c.st.write(deviceIDFile, []byte(id)); err != nil {
-		c.warnOnceLocked("device_id_write", "Ravensight: could not save the device id, so this launch counts as a new player.")
-	}
-	return id
+	c.saveDeviceIDLater()
+	return newDeviceID()
 }
 
 func (c *Client) loadQueueLocked() {
@@ -733,8 +733,12 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closing {
 		c.unlock()
-		<-c.done
-		return nil
+		select {
+		case <-c.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	c.closing = true
 	if !c.cfg.NoLifecycleEvents && !c.exitedQueued && c.activeLocked() {
@@ -809,6 +813,7 @@ func (c *Client) SetTrackingEnabled(on bool) error {
 	if !on {
 		c.optedIn = false
 	}
+	c.updateCaptureGateLocked() // the hooks stop before anything is deleted
 	st := savedState{OptedOut: c.optedOut, OptedIn: c.optedIn}
 	c.unlock()
 	err := c.st.saveState(st)
@@ -931,14 +936,60 @@ func (c *Client) resetDeviceLocked() {
 		c.deviceID = newDeviceID() // the game's own id: a new one for this run only
 	} else if c.consentLocked() {
 		c.deviceID = newDeviceID()
-		if err := c.st.write(deviceIDFile, []byte(c.deviceID)); err != nil {
-			c.warnOnceLocked("device_id_write", "Ravensight: could not save the device id, so this launch counts as a new player.")
-		}
+		c.saveDeviceIDLater()
 	} else {
-		c.deviceID = ""
-		c.st.remove(deviceIDFile)
+		c.deviceID = "" // the file is deleted, so the old id never comes back
+		c.saveDeviceIDLater()
+	}
+	if c.id.stored.AccountHash != "" || c.id.held != "" {
+		c.id.wantSession = true // the next session identifies again
 	}
 	c.wakeWorker()
+}
+
+// saveDeviceIDLater writes the device id file once mu is released, with
+// the id current then: an empty id deletes the file. A game's own
+// Config.DeviceID is never written. ioMu keeps two saves in order.
+func (c *Client) saveDeviceIDLater() {
+	if strings.TrimSpace(c.cfg.DeviceID) != "" || c.isPlaytest || !c.st.enabled() {
+		return
+	}
+	c.after = append(c.after, func() {
+		c.ioMu.Lock()
+		defer c.ioMu.Unlock()
+		c.mu.Lock()
+		id := c.deviceID
+		c.mu.Unlock()
+		if id == "" {
+			c.st.remove(deviceIDFile)
+			return
+		}
+		if err := c.st.write(deviceIDFile, []byte(id)); err != nil {
+			c.mu.Lock()
+			c.warnOnceLocked("device_id_write", "Ravensight: could not save the device id, so this launch counts as a new player.")
+			c.unlock()
+		}
+	})
+}
+
+// saveIdentityLater writes the identity file once mu is released, with the
+// identity current then, so a save and a delete never land out of order.
+func (c *Client) saveIdentityLater() {
+	if c.isPlaytest || !c.st.enabled() {
+		return
+	}
+	c.after = append(c.after, func() {
+		c.ioMu.Lock()
+		defer c.ioMu.Unlock()
+		c.mu.Lock()
+		id := c.id.stored
+		c.mu.Unlock()
+		if err := c.st.saveIdentity(id); err != nil {
+			c.mu.Lock()
+			c.warnOnceLocked("identity_write", "Ravensight: could not save the identity file.")
+			c.unlock()
+		}
+	})
 }
 
 // DeviceID is the id in use, "" before the player agrees under

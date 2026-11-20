@@ -45,6 +45,8 @@ type captureState struct {
 	tokensAt         time.Time
 	trails           int
 	trail            []string
+	spent            map[string]bool // raw type and message pairs past their per-key cap
+	crashWrites      int             // crash records written this run
 }
 
 // prepared is a scrubbed capture.
@@ -76,9 +78,9 @@ func (c *Client) captureGateLocked() bool {
 // hooks make first, so a game that logs every frame pays almost nothing
 // while capture is off or its caps are spent.
 func (c *Client) updateCaptureGateLocked() {
-	live := c.captureGateLocked()
+	live := c.captureGateLocked() && c.cap.captured < capturesPerRun
 	c.capLive.Store(live)
-	c.trailLive.Store(live && c.cap.known && c.cap.trailOn)
+	c.trailLive.Store(live && c.cap.known && c.cap.trailOn && c.cap.trails < trailsPerRun)
 }
 
 // SetErrorCapture turns automatic error capture on or off for this run. It
@@ -99,7 +101,14 @@ func (c *Client) SetErrorCapture(on bool) {
 
 // IsErrorCaptureActive reports whether automatic capture is live: a key,
 // consent, switched on here and on the server.
-func (c *Client) IsErrorCaptureActive() bool { return c != nil && c.capLive.Load() }
+func (c *Client) IsErrorCaptureActive() bool {
+	if c == nil || c.inert {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.captureGateLocked()
+}
 
 // applyCaptureAnswerLocked reads errorCapture {enabled, trail} from a
 // settings or session answer. An answer without it means on, no trail.
@@ -127,14 +136,9 @@ func (c *Client) applyCaptureAnswerLocked(raw json.RawMessage) {
 	c.cap.hold = nil
 	for _, h := range hold {
 		if c.captureGateLocked() {
-			trail := ""
-			if c.cap.trailOn && h.trail != "" {
-				trail = scrubField(h.trail, trailUnits)
-			}
-			c.queueCaptureLocked(h.p, trail)
-		}
-		if h.file != "" {
-			c.st.remove(h.file)
+			c.queueCaptureLocked(h.p, h.trail, h.file)
+		} else if h.file != "" {
+			c.st.remove(h.file) // the game's switch is off: discarded unsent
 		}
 	}
 }
@@ -147,6 +151,9 @@ func (c *Client) resetCaptureLocked() {
 	c.cap.tokensAt = time.Time{}
 	c.cap.trails = 0
 	c.cap.trail = nil
+	c.cap.spent = nil
+	c.cap.crashWrites = 0
+	c.updateCaptureGateLocked()
 }
 
 func (c *Client) refillLocked(now time.Time) float64 {
@@ -164,20 +171,39 @@ func (c *Client) hasRoomLocked(now time.Time) bool {
 	return c.cap.captured < capturesPerRun && c.refillLocked(now) >= 1
 }
 
-func (c *Client) allowLocked(key string, now time.Time) bool {
-	if c.cap.captured >= capturesPerRun || c.cap.perKey[key] >= capturesPerKey {
-		return false
+// allowLocked takes a capture's place in the caps. keyFull reports a
+// refusal by the per-key cap alone.
+func (c *Client) allowLocked(key string, now time.Time) (ok, keyFull bool) {
+	if c.cap.captured >= capturesPerRun {
+		return false, false
+	}
+	if c.cap.perKey[key] >= capturesPerKey {
+		return false, true
 	}
 	tokens := c.refillLocked(now)
 	c.cap.tokensAt = now
 	if tokens < 1 {
 		c.cap.tokens = tokens
-		return false
+		return false, false
 	}
 	c.cap.tokens = tokens - 1
 	c.cap.captured++
 	c.cap.perKey[key]++
-	return true
+	if c.cap.captured >= capturesPerRun {
+		c.updateCaptureGateLocked() // spent: the hooks stop paying at once
+	}
+	return true, false
+}
+
+// captureRoom is the cheap check every hook makes before it builds a
+// message: the gate, the run cap and the bucket.
+func (c *Client) captureRoom() bool {
+	if c == nil || !c.capLive.Load() {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hasRoomLocked(c.now())
 }
 
 // prepare scrubs a capture's text. It runs without the lock.
@@ -200,38 +226,54 @@ func (c *Client) capture(source, severity, errType, message, stack string) {
 	if c == nil || !c.capLive.Load() {
 		return
 	}
+	raw := errType + "|" + cutUnits(message, 4*messageUnits)
 	c.mu.Lock()
-	room := c.hasRoomLocked(c.now())
+	room := c.hasRoomLocked(c.now()) && !c.cap.spent[raw]
 	c.unlock()
 	if !room {
-		return
+		return // an error loop past its caps pays no scrub
 	}
 	p, ok := prepare(source, severity, errType, message, stack, 0)
 	if !ok {
 		return
 	}
 	c.mu.Lock()
-	c.captureLocked(p)
+	c.captureLocked(p, raw)
 	c.unlock()
 }
 
-func (c *Client) captureLocked(p prepared) {
-	if !c.captureGateLocked() || !c.allowLocked(p.key, c.now()) {
+func (c *Client) captureLocked(p prepared, raw string) {
+	if !c.captureGateLocked() {
+		return
+	}
+	ok, keyFull := c.allowLocked(p.key, c.now())
+	if keyFull {
+		if len(c.cap.spent) >= 256 {
+			c.cap.spent = nil
+		}
+		if c.cap.spent == nil {
+			c.cap.spent = map[string]bool{}
+		}
+		c.cap.spent[raw] = true
+	}
+	if !ok {
 		return
 	}
 	if !c.cap.known {
 		if len(c.cap.hold) < holdMax {
 			c.cap.hold = append(c.cap.hold, held{p: p})
+			c.wakeWorker() // the switch is read even with nothing else to send
 		}
 		return
 	}
-	c.queueCaptureLocked(p, "")
+	c.queueCaptureLocked(p, "", "")
 }
 
 // queueCaptureLocked queues a capture as an ordinary error event. The
 // trail goes with it only while the game's trail switch is on, at most 10
-// times a run.
-func (c *Client) queueCaptureLocked(p prepared, trail string) {
+// times a run: the live ring for a capture of this run, or the trail saved
+// with a crash record (file) for one from the last run, never the other.
+func (c *Client) queueCaptureLocked(p prepared, recordTrail, file string) {
 	fields := map[string]json.RawMessage{
 		"rs_kind":     mustJSON("error"),
 		"rs_severity": mustJSON(p.severity),
@@ -246,15 +288,25 @@ func (c *Client) queueCaptureLocked(p prepared, trail string) {
 		fields["rs_stack"] = mustJSON(p.stack)
 		texts["rs_stack"] = p.stack
 	}
-	if trail == "" && c.cap.trailOn && len(c.cap.trail) > 0 && c.cap.trails < trailsPerRun {
-		trail = c.trailTextLocked()
-		c.cap.trails++
+	trail := ""
+	if c.cap.trailOn && c.cap.trails < trailsPerRun {
+		if file == "" && len(c.cap.trail) > 0 {
+			trail = c.trailTextLocked()
+		} else if file != "" && recordTrail != "" {
+			trail = scrubField(recordTrail, trailUnits)
+		}
 	}
 	if trail != "" {
+		c.cap.trails++
+		c.updateCaptureGateLocked()
 		fields["rs_trail"] = mustJSON(trail)
 		texts["rs_trail"] = trail
 	}
-	c.trackAtLocked("error", fields, true, texts, p.timestamp)
+	if c.trackAtLocked("error", fields, true, texts, p.timestamp) && file != "" {
+		// The record stays on disk until a 2xx or a 400 that names it: it is
+		// this event's storage, so a failed send never loses the crash.
+		c.events[len(c.events)-1].crashFile = file
+	}
 }
 
 // --- The trail -----------------------------------------------------------------
@@ -308,15 +360,22 @@ func levelName(l slog.Level) string {
 }
 
 // observeLog feeds one log line to the trail and, at error level, to
-// capture. The SDK's own lines are never captured.
-func (c *Client) observeLog(level slog.Level, msg string, errType string) {
-	if c == nil || strings.HasPrefix(msg, "Ravensight") {
+// capture. The SDK's own lines are never captured. build makes the message
+// and error type only once something will use them, so a game that logs
+// every frame pays two atomic loads while capture is off or spent.
+func (c *Client) observeLog(level slog.Level, build func() (msg, errType string)) {
+	if c == nil {
 		return
 	}
 	trail := c.trailLive.Load()
 	capture := level >= slog.LevelError && c.capLive.Load()
-	if !trail && !capture {
-		return // the hot path: nothing is copied or scrubbed
+	if !trail && (!capture || !c.captureRoom()) {
+		return // the hot path: nothing is copied, formatted or scrubbed
+	}
+	defer func() { _ = recover() }() // a game value that panics while formatting costs one line, never the game
+	msg, errType := build()
+	if strings.HasPrefix(msg, "Ravensight") {
+		return
 	}
 	if capture {
 		c.capture("log", "warning", errType, msg, "")
@@ -334,7 +393,7 @@ func (c *Client) observeLog(level slog.Level, msg string, errType string) {
 // slog.LevelError or above is sent as an error with rs_source "log" and
 // severity "warning". It never blocks on the network and never fails.
 func (c *Client) Log(level slog.Level, msg string) {
-	c.observeLog(level, msg, "")
+	c.observeLog(level, func() (string, string) { return msg, "" })
 }
 
 // LogHandler wraps a log/slog handler so your game's log feeds error
@@ -342,11 +401,15 @@ func (c *Client) Log(level slog.Level, msg string) {
 // message, plus the first error-valued attribute, whose type becomes
 // rs_error_type), and every record joins the trail while the game's trail
 // switch is on. Every record still reaches next exactly as before.
+// Wrapping a handler this client already wraps returns it unchanged.
 //
 //	slog.SetDefault(slog.New(client.LogHandler(slog.NewTextHandler(os.Stderr, nil))))
 func (c *Client) LogHandler(next slog.Handler) slog.Handler {
 	if next == nil {
 		next = discardHandler{}
+	}
+	if h, ok := next.(*logHandler); ok && h.c == c {
+		return next
 	}
 	return &logHandler{c: c, next: next}
 }
@@ -365,18 +428,19 @@ func (h *logHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *logHandler) Handle(ctx context.Context, r slog.Record) error {
-	if c := h.c; c != nil && (c.trailLive.Load() || (r.Level >= slog.LevelError && c.capLive.Load())) {
+	h.c.observeLog(r.Level, func() (string, string) {
 		msg, errType := r.Message, ""
 		r.Attrs(func(a slog.Attr) bool {
 			if err, ok := a.Value.Any().(error); ok && err != nil {
-				msg += ": " + err.Error()
+				// fmt survives a nil receiver or an Error method that panics.
+				msg += ": " + fmt.Sprint(err)
 				errType = fmt.Sprintf("%T", err)
 				return false
 			}
 			return true
 		})
-		c.observeLog(r.Level, msg, errType)
-	}
+		return msg, errType
+	})
 	if h.next.Enabled(ctx, r.Level) {
 		return h.next.Handle(ctx, r)
 	}
@@ -412,6 +476,9 @@ func (c *Client) WrapTransport(next http.RoundTripper) http.RoundTripper {
 	if next == nil {
 		next = http.DefaultTransport
 	}
+	if t, ok := next.(*captureTransport); ok && t.c == c {
+		return next
+	}
 	return &captureTransport{c: c, next: next}
 }
 
@@ -425,6 +492,9 @@ func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	c := t.c
 	if c == nil || !c.capLive.Load() || req.Context().Value(sdkRequestKey{}) != nil ||
 		strings.EqualFold(req.URL.Host, c.apiHost) {
+		return resp, err
+	}
+	if (err == nil && resp.StatusCode < 400) || !c.captureRoom() {
 		return resp, err
 	}
 	switch {
@@ -468,25 +538,43 @@ func requestMessage(req *http.Request, status string) string {
 // The record holds the panic's type, its message and the stack, scrubbed on
 // the device, and is written synchronously to the storage directory. The
 // next launch with a key and consent sends it once as an error with
-// rs_source "crash" and severity "critical". Nothing is written without a
-// key, before consent, while capture is off, or in a playtest run.
+// rs_source "crash" and severity "critical". If the program is still
+// running two seconds later, an outer recover (net/http recovers its
+// handlers' panics) caught it, so it was not a crash: the record is
+// deleted and the panic is sent now as rs_source "uncaught", severity
+// "error". Nothing is written without a key, before consent, while capture
+// is off, in a playtest run, or past 5 records a run.
 func (c *Client) Recover() {
 	r := recover()
 	if r == nil {
 		return
 	}
-	c.recordCrash(r, debug.Stack())
+	func() {
+		defer func() { _ = recover() }() // the SDK's own failure never changes the game's panic
+		c.recordCrash(r)
+	}()
 	panic(r)
 }
 
-func (c *Client) recordCrash(r any, stack []byte) {
-	if c == nil || c.inert || c.isPlaytest || !c.capLive.Load() || !c.st.enabled() {
+func (c *Client) recordCrash(r any) {
+	if c == nil || c.inert || c.isPlaytest || !c.st.enabled() {
 		return
 	}
-	message := fmt.Sprint(r)
-	if err, ok := r.(error); ok {
-		message = err.Error()
+	c.mu.Lock()
+	ok := c.captureGateLocked() && c.cap.crashWrites < crashMax
+	if ok {
+		c.cap.crashWrites++
 	}
+	gen := c.generation
+	trail := ""
+	if ok && c.cap.known && c.cap.trailOn && len(c.cap.trail) > 0 {
+		trail = c.trailTextLocked() // only while the trail switch is on
+	}
+	c.unlock()
+	if !ok {
+		return
+	}
+	message := fmt.Sprint(r) // fmt survives a nil receiver or an Error method that panics
 	if strings.TrimSpace(message) == "" {
 		message = "panic"
 	}
@@ -494,19 +582,46 @@ func (c *Client) recordCrash(r any, stack []byte) {
 		Timestamp: c.now().UnixMilli(),
 		Type:      strings.TrimSpace(scrubField(fmt.Sprintf("%T", r), typeUnits)),
 		Message:   strings.TrimSpace(scrubField(validUTF8(message), messageUnits)),
-		Stack:     scrubField(validUTF8(panicStack(string(stack))), stackUnits),
+		Stack:     scrubField(validUTF8(panicStack(string(debug.Stack()))), stackUnits),
+		Trail:     trail,
 	}
-	c.mu.Lock()
-	if c.cap.known && c.cap.trailOn && len(c.cap.trail) > 0 {
-		rec.Trail = c.trailTextLocked() // only while the trail switch is on
-	}
-	c.unlock()
 	raw, err := marshalJSON(rec)
 	if err != nil {
 		return
 	}
-	_ = c.st.write(fmt.Sprintf("%s%d-%s.json", crashPrefix, rec.Timestamp, randomHex(3)), raw)
+	name := fmt.Sprintf("%s%d-%s.json", crashPrefix, rec.Timestamp, randomHex(3))
+	if c.st.write(name, raw) != nil {
+		return
+	}
+	// An opt-out or a reset while the record was written deletes it.
+	c.mu.Lock()
+	still := c.captureGateLocked() && gen == c.generation
+	c.unlock()
+	if !still {
+		c.st.remove(name)
+		return
+	}
 	c.pruneCrashes()
+	time.AfterFunc(c.recoveredAfter(), func() { c.recoveredPanic(name, rec) })
+}
+
+// recoveredAfter is how long a recorded panic waits before the client
+// decides the program survived it.
+func (c *Client) recoveredAfter() time.Duration {
+	if c.crashGrace > 0 {
+		return c.crashGrace
+	}
+	return 2 * time.Second
+}
+
+// recoveredPanic runs when the program outlived its panic: an outer recover
+// caught it. The record is deleted and the panic sent now, through the caps.
+func (c *Client) recoveredPanic(name string, rec crashRecord) {
+	if _, err := c.st.read(name); err != nil {
+		return // sent or deleted already
+	}
+	c.capture("uncaught", "error", rec.Type, rec.Message, rec.Stack)
+	c.st.remove(name)
 }
 
 // panicStack keeps the frames from the panicking function down: the
@@ -535,15 +650,16 @@ func panicStack(stack string) string {
 	return strings.Join(out, "\n")
 }
 
-// pruneCrashes keeps the newest 5 records.
+// pruneCrashes deletes records older than 30 days and keeps the newest 5,
+// whatever the gate says.
 func (c *Client) pruneCrashes() {
 	names := c.st.list(crashPrefix)
-	if len(names) <= crashMax {
-		return
-	}
 	sort.Slice(names, func(i, j int) bool { return crashTime(names[i]) < crashTime(names[j]) })
-	for _, name := range names[:len(names)-crashMax] {
-		c.st.remove(name)
+	oldest := c.now().Add(-crashMaxAge).UnixMilli()
+	for i, name := range names {
+		if crashTime(name) < oldest || i < len(names)-crashMax {
+			c.st.remove(name)
+		}
 	}
 }
 
@@ -555,7 +671,8 @@ func crashTime(name string) int64 {
 }
 
 // loadCrashesLocked sends what the last run recorded, through the caps and
-// the boot hold. Records older than 30 days are deleted unsent.
+// the boot hold. Records older than 30 days are deleted unsent. A record
+// stays on disk until its event is acknowledged.
 func (c *Client) loadCrashesLocked() {
 	if !c.captureGateLocked() || c.isPlaytest {
 		return
@@ -563,7 +680,7 @@ func (c *Client) loadCrashesLocked() {
 	names := c.st.list(crashPrefix)
 	sort.Slice(names, func(i, j int) bool { return crashTime(names[i]) < crashTime(names[j]) })
 	for _, name := range names {
-		if c.holdsFileLocked(name) {
+		if c.holdsFileLocked(name) || c.queuedFileLocked(name) {
 			continue
 		}
 		raw, err := c.st.read(name)
@@ -578,23 +695,28 @@ func (c *Client) loadCrashesLocked() {
 			c.st.remove(name)
 			continue
 		}
-		if !c.allowLocked(p.key, c.now()) {
-			c.st.remove(name)
+		if allowed, _ := c.allowLocked(p.key, c.now()); !allowed {
+			c.st.remove(name) // past the caps: the same crash was sent enough
 			continue
 		}
 		if !c.cap.known {
 			if len(c.cap.hold) < holdMax {
 				c.cap.hold = append(c.cap.hold, held{p: p, file: name, trail: rec.Trail})
+				c.wakeWorker()
 			}
 			continue
 		}
-		trail := ""
-		if c.cap.trailOn {
-			trail = scrubField(rec.Trail, trailUnits)
-		}
-		c.queueCaptureLocked(p, trail)
-		c.st.remove(name)
+		c.queueCaptureLocked(p, rec.Trail, name)
 	}
+}
+
+func (c *Client) queuedFileLocked(name string) bool {
+	for _, e := range c.events {
+		if e.crashFile == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) holdsFileLocked(name string) bool {

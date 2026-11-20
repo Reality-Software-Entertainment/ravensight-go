@@ -128,7 +128,8 @@ func (c *Client) nextActionLocked(now time.Time, urgent bool) action {
 	identifyWants := c.identifyWantsSessionLocked()
 	configDue := c.rc.wanted
 	if !c.settingsRead {
-		if eventsDue || feedbackDue || identifyWants || configDue || sendable > 0 {
+		// Held captures wait for the game's switch, which this answer carries.
+		if eventsDue || feedbackDue || identifyWants || configDue || sendable > 0 || len(c.cap.hold) > 0 {
 			return actSettings
 		}
 		return actNone
@@ -178,7 +179,7 @@ func (c *Client) nextWakeLocked(now time.Time) time.Time {
 		consider(later(c.batchDue))
 	}
 	if c.sendableLocked() >= maxBatch || len(c.jobs) > 0 || c.rc.wanted || c.identifyWantsSessionLocked() ||
-		(!c.settingsRead && c.sendableLocked() > 0) {
+		(!c.settingsRead && (c.sendableLocked() > 0 || len(c.cap.hold) > 0)) {
 		consider(later(now))
 	}
 	return at
@@ -334,6 +335,14 @@ func (c *Client) scheduleBackoffLocked() {
 
 func (c *Client) succeededLocked() {
 	c.backoff = 0
+	c.answeredLocked()
+}
+
+// answeredLocked records a settings or session success: the wait is over
+// and the status is clear, but the backoff keeps its length until a batch
+// is acknowledged, so a batch that keeps failing behind fresh sessions
+// still backs off to 5 minutes.
+func (c *Client) answeredLocked() {
 	c.nextAttempt = time.Time{}
 	c.transient = StatusOK
 	c.statusChangedLocked()
@@ -373,7 +382,7 @@ func (c *Client) readSettings() bool {
 			c.stopLocked(StatusTrackingDisabled, "Ravensight: tracking is switched off for this game on the server, so nothing is sent this run.")
 			return false
 		}
-		c.succeededLocked()
+		c.answeredLocked()
 		return true
 	case a.err == nil && (a.status == 401 || a.status == 403):
 		c.stopForRefusalLocked(a)
@@ -496,7 +505,7 @@ func (c *Client) openSession() bool {
 		}
 		c.identifySessionAnswerLocked(salt)
 		c.rc.wanted = true
-		c.succeededLocked()
+		c.answeredLocked()
 		return true
 	}
 	if a.err == nil && a.status == 401 && a.code == "invalid_join_token" {
@@ -518,9 +527,13 @@ func (c *Client) openSession() bool {
 }
 
 func sessionExpiry(now time.Time, expiresIn float64, expiresAt json.RawMessage) time.Time {
-	const margin = 60 * time.Second
+	margin := 60 * time.Second
 	if expiresIn > 0 {
-		return now.Add(time.Duration(expiresIn*float64(time.Second)) - margin)
+		life := time.Duration(expiresIn * float64(time.Second))
+		if life < 10*margin {
+			margin = life / 10 // a short session is never read as already expired
+		}
+		return now.Add(life - margin)
 	}
 	var at string
 	if json.Unmarshal(expiresAt, &at) == nil {
@@ -710,6 +723,9 @@ func (c *Client) removeLocked(batch []*qevent) {
 	gone := make(map[uint64]bool, len(batch))
 	for _, e := range batch {
 		gone[e.seq] = true
+		if e.crashFile != "" {
+			c.st.remove(e.crashFile) // delivered or refused: the record is done
+		}
 	}
 	kept := c.events[:0]
 	for _, e := range c.events {
