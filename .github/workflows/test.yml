@@ -1,0 +1,73 @@
+name: test
+
+# Nightly on weekdays and on demand, never on a push or a pull request
+# (owner decision, November 19, 2026). Changes are checked locally first by
+# the pre-push hook in .githooks; this run is the safety net behind it, and
+# a night when main has not moved since a green run in the last 7 days costs one short job.
+on:
+  schedule:
+    - cron: '25 6 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quiet:
+    # A scheduled run on a main that passed in the last 7 days is skipped; a dispatch always runs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          wf=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          last=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?event=schedule&status=success&branch=main&per_page=1" --jq '.workflow_runs[0] // {} | "\(.head_sha // "") \(.run_started_at // "")"')
+          sha=${last%% *}
+          started=${last#* }
+          age_days=999
+          if [ -n "$started" ]; then age_days=$(( ($(date -u +%s) - $(date -u -d "$started" +%s)) / 86400 )); fi
+          # Dependencies and runner images change without a commit, so only a
+          # green run on this commit from the last 7 days lets a night be skipped.
+          if [ "$sha" = "$GITHUB_SHA" ] && [ "$age_days" -lt 7 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "main is unchanged since a green nightly $age_days days ago ($sha)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  go:
+    name: Go ${{ matrix.go }}, race detector
+    needs: quiet
+    if: needs.quiet.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The module's go directive, and the current release.
+        go: ['1.22.x', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "gofmt would change:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: The examples run with no key and send nothing
+        run: go run ./examples/game && go run ./examples/backend
+      - name: The pre-push hook's refuse paths
+        run: sh .githooks/test-pre-push.sh
